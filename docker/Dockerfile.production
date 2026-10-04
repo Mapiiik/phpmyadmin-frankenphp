@@ -1,0 +1,112 @@
+# syntax=docker/dockerfile:1
+
+# phpMyAdmin release, CI passes the version of the current official image
+ARG PHPMYADMIN_VERSION=5.2.3
+
+########################################
+# Source stage – official phpMyAdmin   #
+########################################
+FROM phpmyadmin:${PHPMYADMIN_VERSION}-fpm-alpine AS phpmyadmin
+
+########################################
+# Runtime stage                        #
+########################################
+FROM dunglas/frankenphp:php8.4-alpine
+
+ARG PHPMYADMIN_VERSION
+ARG buildno
+ARG gitcommithash
+
+ARG APPLICATION_USER=application
+
+LABEL application="phpMyAdmin"
+LABEL version="${PHPMYADMIN_VERSION}"
+LABEL maintainer="github.com/Mapiiik"
+
+RUN echo "Build number: $buildno"
+RUN echo "Based on commit: $gitcommithash"
+
+############################
+# System dependencies
+############################
+RUN apk add --no-cache \
+    mariadb-client
+
+############################
+# PHP extensions
+############################
+RUN install-php-extensions \
+    intl \
+    mbstring \
+    mysqli \
+    pdo \
+    pdo_mysql \
+    zip \
+    gd \
+    opcache
+
+############################
+# PHP configuration
+############################
+# Use production defaults
+RUN cp $PHP_INI_DIR/php.ini-production $PHP_INI_DIR/php.ini
+
+# Memory limit
+RUN echo "memory_limit = 512M" > $PHP_INI_DIR/conf.d/99-memory.ini
+
+# Upload limits
+RUN echo "upload_max_filesize = 512M" > $PHP_INI_DIR/conf.d/99-upload.ini \
+ && echo "post_max_size = 512M" >> $PHP_INI_DIR/conf.d/99-upload.ini
+
+# Execution time
+RUN echo "max_execution_time = 300" > $PHP_INI_DIR/conf.d/99-timeouts.ini
+
+# Timezone
+RUN echo "date.timezone = UTC" > $PHP_INI_DIR/conf.d/99-timezone.ini
+
+############################
+# Install phpMyAdmin
+############################
+COPY --from=phpmyadmin /var/www/html /app/public
+COPY --from=phpmyadmin /etc/phpmyadmin /etc/phpmyadmin
+RUN mkdir -p /sessions && chmod 1777 /sessions
+
+###########################
+# Add on-start commands
+###########################
+RUN cat <<'EOF' > /usr/local/bin/docker-entrypoint-custom
+#!/bin/sh
+set -e
+
+if [ ! -f /etc/phpmyadmin/config.secret.inc.php ];then
+    cat > /etc/phpmyadmin/config.secret.inc.php <<SECRET
+<?php
+\$cfg['blowfish_secret'] = '$(tr -dc 'a-zA-Z0-9~!@#$%^&*_()+}{?></";.,[]=-' < /dev/urandom | fold -w 32 | head -n 1)';
+SECRET
+fi
+chmod 600 /etc/phpmyadmin/config.secret.inc.php
+
+if [ ! -f /etc/phpmyadmin/config.user.inc.php ]; then
+    touch /etc/phpmyadmin/config.user.inc.php
+fi
+chmod 600 /etc/phpmyadmin/config.user.inc.php
+
+exec docker-php-entrypoint "$@"
+EOF
+
+RUN chmod +x /usr/local/bin/docker-entrypoint-custom
+
+ENTRYPOINT ["docker-entrypoint-custom"]
+CMD ["--config", "/etc/frankenphp/Caddyfile", "--adapter", "caddyfile"]
+
+############################
+# Non-root runtime
+############################
+RUN \
+    adduser -D ${APPLICATION_USER}; \
+    # Add additional capability to bind to port 80 and 443
+    setcap CAP_NET_BIND_SERVICE=+eip /usr/local/bin/frankenphp; \
+    # Give write access to /config/caddy and /data/caddy
+    chown -R ${APPLICATION_USER}:${APPLICATION_USER} /config/caddy /data/caddy /app/public /etc/phpmyadmin /sessions
+
+USER ${APPLICATION_USER}
